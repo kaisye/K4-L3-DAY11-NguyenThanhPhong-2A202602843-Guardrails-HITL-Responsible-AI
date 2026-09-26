@@ -13,6 +13,10 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from guardrails.security_normalization import (
+    canonicalize_security_text,
+    compact_security_text,
+)
 
 
 # ============================================================
@@ -37,7 +41,12 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    # Inspect and redact the canonical representation. NFKC turns the
+    # full-width output observed in attack_results.json back into ASCII before
+    # regex matching, so downstream Unicode normalization cannot reveal data
+    # that this layer considered safe.
+    canonical = canonicalize_security_text(response)
+    redacted = canonical
 
     # PII patterns to check
     PII_PATTERNS = {
@@ -46,18 +55,49 @@ def content_filter(response: str) -> dict:
         "CMND/CCCD": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
         "API key": r"\bsk-[a-zA-Z0-9-]+\b",
         "password": r"\bpassword\s*(?:is|[:=])\s*\S+",
+        "internal database host": r"\b(?:[a-z0-9-]+\.)+internal(?::\d{2,5})?\b",
+        "bearer token": r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}",
+        "private key": r"-----BEGIN\s+(?:RSA|EC|OPENSSH)?\s*PRIVATE KEY-----[\s\S]*?-----END\s+(?:RSA|EC|OPENSSH)?\s*PRIVATE KEY-----",
+        "internal IP address": r"(?<![\d.])(?:10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.(?:\d{1,3}\.)?\d{1,3})(?![\d.])",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, canonical, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Secondary comparison view catches punctuation/spacing splitting such as
+    # ``s k - vin bank - secret``. Mapping arbitrary obfuscation back to exact
+    # source spans is unsafe, so this branch fails closed and replaces the
+    # complete reply.
+    compact = compact_security_text(response)
+    protected_markers = (
+        "admin123",
+        "skvinbanksecret",
+        "dbvinbankinternal",
+    )
+    if any(marker in compact for marker in protected_markers):
+        if "encoded/obfuscated protected value" not in issues:
+            issues.append("encoded/obfuscated protected value")
+        redacted = "[REDACTED — protected content blocked]"
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
+    }
+
+
+def inspect_output(response: str) -> dict:
+    """Return an explainable output decision for audit/UI consumers."""
+    result = content_filter(response)
+    return {
+        "action": "ALLOW" if result["safe"] else "REDACT",
+        "layer": "output_policy" if result["safe"] else "output_secret",
+        "reason": "no_sensitive_content" if result["safe"] else "; ".join(result["issues"]),
+        "issues": result["issues"],
+        "redacted": result["redacted"],
     }
 
 

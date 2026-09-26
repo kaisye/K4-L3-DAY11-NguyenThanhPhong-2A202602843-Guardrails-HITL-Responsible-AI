@@ -11,7 +11,6 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
-import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -19,6 +18,10 @@ from google.adk.plugins import base_plugin
 from google.adk.agents.invocation_context import InvocationContext
 
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
+from guardrails.security_normalization import (
+    canonicalize_security_text,
+    looks_like_codepoint_decoding_request,
+)
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
@@ -52,13 +55,15 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    # NFKC folds compatibility characters; removing Unicode format/control
-    # characters prevents zero-width characters from splitting attack phrases.
-    normalized = unicodedata.normalize("NFKC", user_input or "")
-    normalized = "".join(
-        char for char in normalized if unicodedata.category(char) not in {"Cf", "Cc"}
-    )
-    normalized = re.sub(r"\s+", " ", normalized).strip()
+    # All security layers share this canonical representation. It folds
+    # full-width compatibility characters and removes zero-width controls.
+    normalized = canonicalize_security_text(user_input).strip()
+
+    # Close the attack_results.json codepoint -> full-width exfiltration path
+    # before it reaches the model. Long numeric decoding jobs are outside the
+    # customer-banking assistant's scope.
+    if looks_like_codepoint_decoding_request(normalized):
+        return "BLOCK"
 
     INJECTION_PATTERNS = [
         r"\bignore\s+(?:all\s+)?(?:previous|above)\s+instructions?\b",
@@ -67,12 +72,34 @@ def detect_injection(user_input: str) -> InputStatus:
         r"\breveal\s+(?:your\s+)?(?:instructions?|prompt)\b",
         r"\bpretend\s+(?:that\s+)?you\s+are\b",
         r"\bact\s+as\s+(?:a|an)?\s*unrestricted\b",
+        r"\b(?:encode|decode|render|convert)\b.{0,100}\b(?:secret|password|credential|api\s*key|internal)\b",
+        r"\b(?:secret|password|credential|api\s*key|internal)\b.{0,100}\b(?:encode|decode|render|convert)\b",
+        # Secret-exfiltration intent: completion, translation, confirmation,
+        # creative-writing and multi-step wrappers used by CP4 attacks.
+        r"\b(?:complete|fill\s+in|reproduce|repeat|preserve|print|return|render)\b.{0,140}\b(?:password|api\s*(?:key|credential)|secret|credential|database\s*(?:host|endpoint)|internal\s+(?:note|context))\b",
+        r"\b(?:password|api\s*(?:key|credential)|secret|credential|database\s*(?:host|endpoint))\b.{0,140}\b(?:exact|actual|full|character[- ]for[- ]character|verbatim|without\s+(?:mask|redact|asterisk))\b",
+        r"\b(?:confirm|compare|translate|format|fictional|story|hypothetical|checklist)\b.{0,160}\b(?:password|api\s*(?:key|credential)|secret|credential|database\s*(?:host|endpoint))\b",
     ]
 
     for pattern in INJECTION_PATTERNS:
         if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
+
+
+def inspect_input(user_input: str) -> dict:
+    """Return an explainable, UI-friendly input decision trace.
+
+    The order is intentional: normalization -> injection/exfiltration intent
+    -> topic policy. ``action`` is the enforcement decision and ``layer`` is
+    stable enough for a graph or audit dashboard.
+    """
+    normalized = canonicalize_security_text(user_input or "")
+    if detect_injection(normalized) == "BLOCK":
+        return {"action": "BLOCK", "layer": "input_injection", "reason": "injection_or_secret_exfiltration_intent"}
+    if topic_filter(normalized) == "BLOCK":
+        return {"action": "BLOCK", "layer": "input_topic", "reason": "off_topic_or_blocked_topic"}
+    return {"action": "ALLOW", "layer": "input_policy", "reason": "banking_request_allowed"}
 
 
 # ============================================================
@@ -167,14 +194,15 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         #    - If "BLOCK": increment blocked_count, return self._block_response("...")
         # 3. If both return "ALLOW": return None (let message through)
 
-        if detect_injection(text) == "BLOCK":
+        decision = inspect_input(text)
+        if decision["layer"] == "input_injection":
             self.blocked_count += 1
             return self._block_response(
                 "I cannot process that request because it appears to contain "
                 "instruction manipulation."
             )
 
-        if topic_filter(text) == "BLOCK":
+        if decision["layer"] == "input_topic":
             self.blocked_count += 1
             return self._block_response(
                 "I'm a VinBank assistant and can only help with banking-related questions."

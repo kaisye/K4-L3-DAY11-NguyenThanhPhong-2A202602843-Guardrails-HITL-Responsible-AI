@@ -29,6 +29,10 @@ from agents.security_boundary import (
 )
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS, DEMO_SECRETS, DEMO_SECRET_NOTE
 from core.utils import chat_with_agent
+from guardrails.security_normalization import (
+    canonicalize_security_text,
+    looks_like_codepoint_decoding_request,
+)
 
 # Secrets embedded in the Red Advance system prompt
 # (same values as Blue + Red).
@@ -97,7 +101,7 @@ _OUTPUT_SECRET_PATTERNS = {
 
 def detect_injection_strong(text: str) -> bool:
     normalized = normalize_for_security(text)
-    return contains_instruction_override(normalized) or any(
+    return looks_like_codepoint_decoding_request(normalized) or contains_instruction_override(normalized) or any(
         re.search(pattern, normalized, re.IGNORECASE) for pattern in _INJECTION_PATTERNS
     )
 
@@ -123,11 +127,19 @@ def topic_filter_strong(text: str) -> bool:
 
 def content_filter_strong(response: str) -> dict:
     issues = []
-    redacted = response
+    canonical = canonicalize_security_text(response)
+    redacted = canonical
     for name, pattern in _OUTPUT_SECRET_PATTERNS.items():
-        if re.search(pattern, response, re.IGNORECASE):
+        if re.search(pattern, canonical, re.IGNORECASE):
             issues.append(name)
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    # contains_secret uses canonical + compact comparison and therefore catches
+    # full-width, inserted punctuation and spacing variants. The Red Advance
+    # path is fail-closed: any protected value blocks the complete response.
+    if contains_secret(response):
+        if "encoded_or_obfuscated_secret" not in issues:
+            issues.append("encoded_or_obfuscated_secret")
+        redacted = "[REDACTED — protected content blocked]"
     return {"safe": len(issues) == 0, "issues": issues, "redacted": redacted}
 
 
