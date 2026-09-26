@@ -31,6 +31,13 @@ def compact_security_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", canonicalize_security_text(text).casefold())
 
 
+def fold_for_matching(text: str) -> str:
+    """Return lowercase accent-free text for Vietnamese keyword matching."""
+    canonical = canonicalize_security_text(text).casefold().replace("đ", "d")
+    decomposed = unicodedata.normalize("NFKD", canonical)
+    return "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+
+
 def looks_like_codepoint_decoding_request(text: str) -> bool:
     """Detect requests that ask the model to decode numeric character streams.
 

@@ -80,7 +80,7 @@ def content_filter(response: str) -> dict:
     if any(marker in compact for marker in protected_markers):
         if "encoded/obfuscated protected value" not in issues:
             issues.append("encoded/obfuscated protected value")
-        redacted = "[REDACTED — protected content blocked]"
+        redacted = "[REDACTED] — protected content blocked"
 
     return {
         "safe": len(issues) == 0,

@@ -20,6 +20,7 @@ from google.adk.agents.invocation_context import InvocationContext
 from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 from guardrails.security_normalization import (
     canonicalize_security_text,
+    fold_for_matching,
     looks_like_codepoint_decoding_request,
 )
 
@@ -65,6 +66,7 @@ def detect_injection(user_input: str) -> InputStatus:
     if looks_like_codepoint_decoding_request(normalized):
         return "BLOCK"
 
+    normalized_match = fold_for_matching(normalized)
     INJECTION_PATTERNS = [
         r"\bignore\s+(?:all\s+)?(?:previous|above)\s+instructions?\b",
         r"\byou\s+are\s+now\b",
@@ -79,10 +81,12 @@ def detect_injection(user_input: str) -> InputStatus:
         r"\b(?:complete|fill\s+in|reproduce|repeat|preserve|print|return|render)\b.{0,140}\b(?:password|api\s*(?:key|credential)|secret|credential|database\s*(?:host|endpoint)|internal\s+(?:note|context))\b",
         r"\b(?:password|api\s*(?:key|credential)|secret|credential|database\s*(?:host|endpoint))\b.{0,140}\b(?:exact|actual|full|character[- ]for[- ]character|verbatim|without\s+(?:mask|redact|asterisk))\b",
         r"\b(?:confirm|compare|translate|format|fictional|story|hypothetical|checklist)\b.{0,160}\b(?:password|api\s*(?:key|credential)|secret|credential|database\s*(?:host|endpoint))\b",
+        r"\b(?:hoan\s+thanh|dien|lap\s+lai|giu\s+nguyen|in|tra\s+ve|xac\s+nhan|so\s+sanh|dich|giai\s+ma)\b.{0,160}\b(?:mat\s+khau|api\s*key|thong\s+tin\s+xac\s+thuc|bi\s+mat|may\s+chu\s+co\s+so\s+du\s+lieu|ngu\s+canh\s+noi\s+bo|ghi\s+chu\s+noi\s+bo)\b",
+        r"\b(?:mat\s+khau|api\s*key|thong\s+tin\s+xac\s+thuc|bi\s+mat|may\s+chu\s+co\s+so\s+du\s+lieu)\b.{0,160}\b(?:chinh\s+xac|that|day\s+du|nguyen\s+van|khong\s+che)\b",
     ]
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, normalized, re.IGNORECASE):
+        if re.search(pattern, normalized_match, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -123,16 +127,16 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = (user_input or "").casefold()
+    input_lower = fold_for_matching(user_input or "")
 
     # TODO: Implement logic:
     # 1. If input contains any blocked topic -> return "BLOCK"
     # 2. If input doesn't contain any allowed topic -> return "BLOCK"
     # 3. Otherwise -> return "ALLOW"
 
-    if any(topic.casefold() in input_lower for topic in BLOCKED_TOPICS):
+    if any(fold_for_matching(topic) in input_lower for topic in BLOCKED_TOPICS):
         return "BLOCK"
-    if any(topic.casefold() in input_lower for topic in ALLOWED_TOPICS):
+    if any(fold_for_matching(topic) in input_lower for topic in ALLOWED_TOPICS):
         return "ALLOW"
     return "BLOCK"
 
